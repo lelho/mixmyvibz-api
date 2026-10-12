@@ -1,5 +1,5 @@
 """MixMyVibz — serveur léger (Render gratuit, 512 Mo) : Auto-Tune + assistant IA. Pas de Demucs ici."""
-import json, os, tempfile, uuid, urllib.request
+import json, os, tempfile, uuid, urllib.request, urllib.error
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -108,3 +108,63 @@ def chat(body: ChatIn):
         return {"reply": j["choices"][0]["message"]["content"]}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, "Assistant indisponible : " + str(e)[:120])
+
+
+# ---- Test temporaire : la clé Gemini a-t-elle accès à Lyria 3 ? (à retirer après le test) ----
+import base64, time
+
+_MT = {"last": 0.0, "audio": None, "mime": "audio/mpeg"}
+
+
+def _find_audio(node):
+    if isinstance(node, dict):
+        if str(node.get("type", "")).lower() == "audio":
+            for v in node.values():
+                if isinstance(v, str) and len(v) > 1000:
+                    return v, str(node.get("mime_type") or node.get("mimeType") or "audio/mpeg")
+        for v in node.values():
+            r = _find_audio(v)
+            if r:
+                return r
+    elif isinstance(node, list):
+        for v in node:
+            r = _find_audio(v)
+            if r:
+                return r
+    return None
+
+
+@app.get("/api/music-test")
+def music_test():
+    key, base = os.environ.get("MMV_LLM_KEY"), os.environ.get("MMV_LLM_BASE_URL", "")
+    if not key or "generativelanguage" not in base:
+        raise HTTPException(503, "Clé Gemini non configurée")
+    if time.time() - _MT["last"] < 120:
+        raise HTTPException(429, "Un test à la fois : réessaie dans 2 minutes")
+    _MT["last"] = time.time()
+    req = urllib.request.Request(
+        "https://generativelanguage.googleapis.com/v1beta/interactions",
+        data=json.dumps({"model": "lyria-3-clip-preview", "input": "A short dark boom bap instrumental, 88 bpm, mellow piano, deep 808 bass, vinyl crackle."}).encode(),
+        headers={"x-goog-api-key": key, "content-type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=110) as r:
+            j = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "ignore")[:400].replace(key, "***")
+        return {"ok": False, "status": e.code, "error": body}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "status": 0, "error": str(e)[:200].replace(key, "***")}
+    a = _find_audio(j)
+    if not a:
+        return {"ok": False, "status": 200, "error": "Réponse sans audio", "keys": list(j.keys())[:10]}
+    _MT["audio"], _MT["mime"] = base64.b64decode(a[0]), a[1]
+    return {"ok": True, "status": 200, "bytes": len(_MT["audio"]), "mime": a[1], "listen": "/api/music-test/audio"}
+
+
+@app.get("/api/music-test/audio")
+def music_test_audio():
+    from fastapi.responses import Response
+    if not _MT["audio"]:
+        raise HTTPException(404, "Aucun test récent")
+    return Response(_MT["audio"], media_type=_MT["mime"])
