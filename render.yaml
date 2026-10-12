@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: mixmyvibz-api
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: MMV_LLM_BASE_URL
+        sync: false
+      - key: MMV_LLM_MODEL
+        sync: false
+      - key: MMV_LLM_KEY
+        sync: false
