@@ -113,7 +113,7 @@ def chat(body: ChatIn):
 
 
 # ---- Paiement Stripe (Checkout hébergé : le site ne touche jamais aux cartes) ----
-import hmac, urllib.parse
+import hmac, time, urllib.parse
 from fastapi import Header, Request
 
 SITE_URL = os.environ.get("MMV_SITE_URL", "https://mixmyvibz.com").rstrip("/")
@@ -147,9 +147,29 @@ def _stripe(method, path, form=None):
         raise HTTPException(502, "Stripe injoignable : " + str(e)[:120].replace(sk, "***"))
 
 
-def _is_admin(key):
+_FAILS = {}  # ip -> [horodatages des échecs récents]
+MAX_FAILS, FAIL_WINDOW = 8, 900  # 8 mauvaises clés en 15 min -> blocage temporaire
+
+
+def _ip(request):
+    fwd = request.headers.get("x-forwarded-for", "")
+    return (fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "?"))
+
+
+def _is_admin(key, request=None):
     expected = os.environ.get("MMV_ADMIN_KEY", "")
-    return bool(expected) and bool(key) and hmac.compare_digest(str(key).encode(), expected.encode())
+    if not key:
+        return False
+    ip, now = (_ip(request) if request else "?"), time.time()
+    recent = [t for t in _FAILS.get(ip, []) if now - t < FAIL_WINDOW]
+    if len(recent) >= MAX_FAILS:
+        _FAILS[ip] = recent
+        raise HTTPException(429, "Trop d'essais. Réessaie dans 15 minutes.")
+    ok = bool(expected) and hmac.compare_digest(str(key).encode(), expected.encode())
+    if not ok:
+        recent.append(now)
+    _FAILS[ip] = recent
+    return ok
 
 
 class CheckoutIn(BaseModel):
@@ -218,8 +238,8 @@ class GuestIn(BaseModel):
 
 
 @app.post("/api/admin/guest")
-def create_guest(body: GuestIn, x_mmv_key: str = Header(default="")):
-    if not _is_admin(x_mmv_key):
+def create_guest(body: GuestIn, request: Request, x_mmv_key: str = Header(default="")):
+    if not _is_admin(x_mmv_key, request):
         raise HTTPException(403, "Clé admin incorrecte")
     if body.plan not in LIMITS:
         raise HTTPException(400, "Offre inconnue")
@@ -248,8 +268,8 @@ def _entitlement_from_guest(code):
 
 
 @app.get("/api/entitlement")
-def entitlement(license: str = "", x_mmv_key: str = Header(default="")):
-    if _is_admin(x_mmv_key):
+def entitlement(request: Request, license: str = "", x_mmv_key: str = Header(default="")):
+    if _is_admin(x_mmv_key, request):
         return {"active": True, "plan": "admin", "admin": True, "limits": {"mixes": None, "maxTracks": 50, "beatmaker": True}}
     license = license.strip()
     if not license:
