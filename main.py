@@ -193,10 +193,69 @@ def _entitlement_from_session(sid):
     return {"active": bool(active), "plan": plan, "limits": LIMITS[plan], "recurring": PLAN_MODE[plan] == "subscription", "email": ((s.get("customer_details") or {}).get("email") or "")}
 
 
+# ---- Accès invités : codes signés (pas de base de données) ----
+# Un code = offre + date de fin + identifiant + libellé, signé avec la clé admin. Changer la clé admin invalide tous les codes.
+# Pour retirer un seul invité : ajouter son identifiant (affiché à la création) dans la variable MMV_REVOKED_GUESTS, séparés par des virgules.
+import base64, time as _time, secrets
+
+
+def _b64(b):
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+
+def _unb64(s):
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _sign(payload):
+    return _b64(hmac.new(os.environ.get("MMV_ADMIN_KEY", "").encode(), payload.encode(), "sha256").digest()[:18])
+
+
+class GuestIn(BaseModel):
+    plan: str = "pro"
+    days: int = 7
+    label: str = ""
+
+
+@app.post("/api/admin/guest")
+def create_guest(body: GuestIn, x_mmv_key: str = Header(default="")):
+    if not _is_admin(x_mmv_key):
+        raise HTTPException(403, "Clé admin incorrecte")
+    if body.plan not in LIMITS:
+        raise HTTPException(400, "Offre inconnue")
+    days = max(1, min(int(body.days), 90))
+    label = "".join(c for c in body.label if c.isalnum() or c in " -_.@")[:40].strip() or "invité"
+    gid = secrets.token_hex(3)
+    exp = int(_time.time()) + days * 86400
+    payload = "|".join([body.plan, str(exp), gid, label])
+    code = "inv_" + _b64(payload.encode()) + "." + _sign(payload)
+    return {"code": code, "id": gid, "plan": body.plan, "expires": exp, "label": label, "link": SITE_URL + "/compte.html?invite=" + urllib.parse.quote(code)}
+
+
+def _entitlement_from_guest(code):
+    try:
+        raw, sig = code[4:].split(".", 1)
+        payload = _unb64(raw).decode()
+        plan, exp, gid, label = payload.split("|", 3)
+        exp = int(exp)
+    except Exception:  # noqa: BLE001
+        raise HTTPException(400, "Code invalide")
+    if not hmac.compare_digest(sig.encode(), _sign(payload).encode()) or plan not in LIMITS:
+        raise HTTPException(404, "Code inconnu")
+    revoked = [x.strip() for x in os.environ.get("MMV_REVOKED_GUESTS", "").split(",") if x.strip()]
+    active = exp > _time.time() and gid not in revoked
+    return {"active": active, "plan": plan, "limits": LIMITS[plan], "guest": True, "expires": exp, "label": label, "recurring": False}
+
+
 @app.get("/api/entitlement")
 def entitlement(license: str = "", x_mmv_key: str = Header(default="")):
     if _is_admin(x_mmv_key):
         return {"active": True, "plan": "admin", "admin": True, "limits": {"mixes": None, "maxTracks": 50, "beatmaker": True}}
+    license = license.strip()
     if not license:
         return {"active": False, "plan": None}
-    return _entitlement_from_session(license.strip())
+    if license.startswith("inv_"):
+        if len(license) > 400 or not os.environ.get("MMV_ADMIN_KEY"):
+            raise HTTPException(400, "Code invalide")
+        return _entitlement_from_guest(license)
+    return _entitlement_from_session(license)
