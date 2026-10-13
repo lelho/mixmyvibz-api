@@ -19,7 +19,7 @@ NOTES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "autotune": True, "separation": False, "master": False, "chat": bool(os.environ.get("MMV_LLM_KEY") or os.environ.get("ANTHROPIC_API_KEY"))}
+    return {"ok": True, "autotune": True, "separation": False, "master": False, "chat": bool(os.environ.get("MMV_LLM_KEY") or os.environ.get("ANTHROPIC_API_KEY")), "payments": bool(os.environ.get("STRIPE_SECRET_KEY"))}
 
 
 @app.get("/")
@@ -110,61 +110,93 @@ def chat(body: ChatIn):
         raise HTTPException(502, "Assistant indisponible : " + str(e)[:120])
 
 
-# ---- Test temporaire : la clé Gemini a-t-elle accès à Lyria 3 ? (à retirer après le test) ----
-import base64, time
-
-_MT = {"last": 0.0, "audio": None, "mime": "audio/mpeg"}
 
 
-def _find_audio(node):
-    if isinstance(node, dict):
-        if str(node.get("type", "")).lower() == "audio":
-            for v in node.values():
-                if isinstance(v, str) and len(v) > 1000:
-                    return v, str(node.get("mime_type") or node.get("mimeType") or "audio/mpeg")
-        for v in node.values():
-            r = _find_audio(v)
-            if r:
-                return r
-    elif isinstance(node, list):
-        for v in node:
-            r = _find_audio(v)
-            if r:
-                return r
-    return None
+# ---- Paiement Stripe (Checkout hébergé : le site ne touche jamais aux cartes) ----
+import hmac, urllib.parse
+from fastapi import Header, Request
+
+SITE_URL = os.environ.get("MMV_SITE_URL", "https://mixmyvibz.com").rstrip("/")
+# Identifiants de prix (non secrets). Mode test pour l'instant ; on les remplacera par ceux du mode réel.
+PRICES = {
+    "single": os.environ.get("STRIPE_PRICE_SINGLE", "price_1UPym3Eh5G6wHLM8sEOfc4lA"),
+    "pro": os.environ.get("STRIPE_PRICE_PRO", "price_1UPymqEh5G6wHLM8ib8uwraT"),
+    "studio": os.environ.get("STRIPE_PRICE_STUDIO", "price_1UPynaEh5G6wHLM89qz4kv8R"),
+}
+PLAN_MODE = {"single": "payment", "pro": "subscription", "studio": "subscription"}
+LIMITS = {
+    "single": {"mixes": 1, "maxTracks": 8, "beatmaker": False},
+    "pro": {"mixes": 15, "maxTracks": 20, "beatmaker": True},
+    "studio": {"mixes": None, "maxTracks": 50, "beatmaker": True},
+}
 
 
-@app.get("/api/music-test")
-def music_test():
-    key, base = os.environ.get("MMV_LLM_KEY"), os.environ.get("MMV_LLM_BASE_URL", "")
-    if not key or "generativelanguage" not in base:
-        raise HTTPException(503, "Clé Gemini non configurée")
-    if time.time() - _MT["last"] < 120:
-        raise HTTPException(429, "Un test à la fois : réessaie dans 2 minutes")
-    _MT["last"] = time.time()
-    req = urllib.request.Request(
-        "https://generativelanguage.googleapis.com/v1beta/interactions",
-        data=json.dumps({"model": "lyria-3-clip-preview", "input": "A short dark boom bap instrumental, 88 bpm, mellow piano, deep 808 bass, vinyl crackle."}).encode(),
-        headers={"x-goog-api-key": key, "content-type": "application/json"},
-    )
+def _stripe(method, path, form=None):
+    sk = os.environ.get("STRIPE_SECRET_KEY", "")
+    if not sk:
+        raise HTTPException(503, "Paiement non configuré sur ce serveur")
+    data = urllib.parse.urlencode(form).encode() if form else None
+    req = urllib.request.Request("https://api.stripe.com/v1/" + path, data=data, method=method, headers={"Authorization": "Bearer " + sk, **({"content-type": "application/x-www-form-urlencoded"} if data else {})})
     try:
-        with urllib.request.urlopen(req, timeout=110) as r:
-            j = json.loads(r.read())
+        with urllib.request.urlopen(req, timeout=25) as r:
+            return json.loads(r.read())
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", "ignore")[:400].replace(key, "***")
-        return {"ok": False, "status": e.code, "error": body}
+        msg = e.read().decode("utf-8", "ignore")[:300].replace(sk, "***")
+        raise HTTPException(502 if e.code >= 500 else 400, "Stripe : " + msg)
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "status": 0, "error": str(e)[:200].replace(key, "***")}
-    a = _find_audio(j)
-    if not a:
-        return {"ok": False, "status": 200, "error": "Réponse sans audio", "keys": list(j.keys())[:10]}
-    _MT["audio"], _MT["mime"] = base64.b64decode(a[0]), a[1]
-    return {"ok": True, "status": 200, "bytes": len(_MT["audio"]), "mime": a[1], "listen": "/api/music-test/audio"}
+        raise HTTPException(502, "Stripe injoignable : " + str(e)[:120].replace(sk, "***"))
 
 
-@app.get("/api/music-test/audio")
-def music_test_audio():
-    from fastapi.responses import Response
-    if not _MT["audio"]:
-        raise HTTPException(404, "Aucun test récent")
-    return Response(_MT["audio"], media_type=_MT["mime"])
+def _is_admin(key):
+    expected = os.environ.get("MMV_ADMIN_KEY", "")
+    return bool(expected) and bool(key) and hmac.compare_digest(str(key).encode(), expected.encode())
+
+
+class CheckoutIn(BaseModel):
+    plan: str
+
+
+@app.post("/api/checkout")
+def checkout(body: CheckoutIn):
+    plan = body.plan
+    if plan not in PRICES:
+        raise HTTPException(400, "Offre inconnue")
+    form = {
+        "mode": PLAN_MODE[plan],
+        "line_items[0][price]": PRICES[plan],
+        "line_items[0][quantity]": "1",
+        "success_url": SITE_URL + "/compte.html?paid=1&session_id={CHECKOUT_SESSION_ID}",
+        "cancel_url": SITE_URL + "/pricing.html?cancelled=1",
+        "metadata[site]": "mixmyvibz",
+        "metadata[plan]": plan,
+    }
+    if PLAN_MODE[plan] == "subscription":
+        form["subscription_data[metadata][site]"] = "mixmyvibz"
+        form["subscription_data[metadata][plan]"] = plan
+    s = _stripe("POST", "checkout/sessions", form)
+    return {"url": s["url"]}
+
+
+def _entitlement_from_session(sid):
+    if not sid.startswith("cs_") or len(sid) > 200 or not sid.replace("_", "").isalnum():
+        raise HTTPException(400, "Code invalide")
+    s = _stripe("GET", "checkout/sessions/" + sid + "?expand[]=subscription")
+    md = s.get("metadata") or {}
+    plan = md.get("plan")
+    if md.get("site") != "mixmyvibz" or plan not in PLAN_MODE:
+        raise HTTPException(404, "Code inconnu")
+    if PLAN_MODE[plan] == "subscription":
+        sub = s.get("subscription") or {}
+        active = isinstance(sub, dict) and sub.get("status") in ("active", "trialing")
+    else:
+        active = s.get("payment_status") == "paid"
+    return {"active": bool(active), "plan": plan, "limits": LIMITS[plan], "recurring": PLAN_MODE[plan] == "subscription", "email": ((s.get("customer_details") or {}).get("email") or "")}
+
+
+@app.get("/api/entitlement")
+def entitlement(license: str = "", x_mmv_key: str = Header(default="")):
+    if _is_admin(x_mmv_key):
+        return {"active": True, "plan": "admin", "admin": True, "limits": {"mixes": None, "maxTracks": 50, "beatmaker": True}}
+    if not license:
+        return {"active": False, "plan": None}
+    return _entitlement_from_session(license.strip())
