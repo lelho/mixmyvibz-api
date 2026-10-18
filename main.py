@@ -124,11 +124,11 @@ import hmac, time, urllib.parse
 from fastapi import Header, Request
 
 SITE_URL = os.environ.get("MMV_SITE_URL", "https://mixmyvibz.com").rstrip("/")
-# Identifiants de prix (non secrets). Mode test pour l'instant ; on les remplacera par ceux du mode réel.
+# Identifiants de prix (non secrets) du compte Stripe MixMyVibz (acct_1UPyW9RNHlUwN64A). Les variables d'environnement STRIPE_PRICE_* de Render ont priorité si elles existent.
 PRICES = {
-    "single": os.environ.get("STRIPE_PRICE_SINGLE", "price_1UPym3Eh5G6wHLM8sEOfc4lA"),
-    "pro": os.environ.get("STRIPE_PRICE_PRO", "price_1UPymqEh5G6wHLM8ib8uwraT"),
-    "studio": os.environ.get("STRIPE_PRICE_STUDIO", "price_1UPynaEh5G6wHLM89qz4kv8R"),
+    "single": os.environ.get("STRIPE_PRICE_SINGLE", "price_1URfcERNHlUwN64AR0tlmldZ"),
+    "pro": os.environ.get("STRIPE_PRICE_PRO", "price_1URfcERNHlUwN64A65XA1UfA"),
+    "studio": os.environ.get("STRIPE_PRICE_STUDIO", "price_1URfcERNHlUwN64AdrtJfABT"),
 }
 PLAN_MODE = {"single": "payment", "pro": "subscription", "studio": "subscription"}
 LIMITS = {
