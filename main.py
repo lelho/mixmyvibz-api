@@ -286,3 +286,7 @@ def entitlement(request: Request, license: str = "", x_mmv_key: str = Header(def
             raise HTTPException(400, "Code invalide")
         return _entitlement_from_guest(license)
     return _entitlement_from_session(license)
+
+# ---- Comptes par lien magique (auth.py) : si le module manque ou plante, le reste du serveur démarre quand même ----
+try: import auth; auth.mount(app)
+except Exception as _e: print('auth indisponible :', _e)
